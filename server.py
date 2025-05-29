@@ -76,7 +76,7 @@ try:
         exit()
 
     # Define the directory where CSV files will be saved
-    data_directory = "./data/API FIle"
+    data_directory = "/home/sam.t/accelocron/apiaccelodata"
 
 
     # Function to convert columns with "date" in their names to date (without time)
@@ -274,7 +274,7 @@ try:
 
 
     # Example usage:
-    data_file_path = './data/API FIle/Company Profiles_merged.csv'
+    data_file_path = '/home/sam.t/accelocron/apiaccelodata'
     desired_columns_companies = ['link_id', 'field_name', 'value']
     transformed_data_companies = transform_data(data_file_path, desired_columns_companies)
 
