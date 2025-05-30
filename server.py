@@ -274,7 +274,7 @@ try:
 
 
     # Example usage:
-    data_file_path = '/home/sam.t/accelocron/apiaccelodata'
+    data_file_path = '/home/sam.t/accelocron/apiaccelodata/Company Profiles_merged.csv'
     desired_columns_companies = ['link_id', 'field_name', 'value']
     transformed_data_companies = transform_data(data_file_path, desired_columns_companies)
 
