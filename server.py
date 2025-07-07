@@ -44,6 +44,7 @@ try:
         f"{base}tasks": "Tasks",
         f"{base}groups": "Groups",
         f"{base}staff/memberships": "Memberships",
+        f"{base}resources": "Resources",
         # Add more endpoints as needed
     }
 
@@ -342,6 +343,7 @@ try:
     export_merged_csv_to_postgresql(data_directory, "Memberships")
     export_merged_csv_to_postgresql(data_directory, "Groups")
     export_merged_csv_to_postgresql(data_directory, "Contract Periods")
+    export_merged_csv_to_postgresql(data_directory, "Resources")
     pass
 except Exception as e:
     print(f"Error: {e}", file=sys.stderr)
