@@ -1,19 +1,28 @@
 import base64
 import logging
 import os
-
-import pandas as pd
+import time
+import json
+from pathlib import Path
+import sqlite3  # (unused; safe to keep/remove)
 import requests
+import pandas as pd
 from dotenv import load_dotenv, find_dotenv
 from pandas.errors import EmptyDataError
 from sqlalchemy import create_engine
 from tqdm import tqdm
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import sys
 
-
 try:
+    # ──────────────────────────────────────────────────────────────────────────
+    # Logging
+    # ──────────────────────────────────────────────────────────────────────────
     logging.basicConfig()
     logging.getLogger('sqlalchemy.engine').setLevel(logging.INFO)
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
 
     load_dotenv(find_dotenv())
 
@@ -44,11 +53,16 @@ try:
         f"{base}tasks": "Tasks",
         f"{base}groups": "Groups",
         f"{base}staff/memberships": "Memberships",
-        f"{base}resources": "Resources",
+        f"{base}object_budgets/services": "Services",
+        f"{base}object_budgets/materials": "Materials",
+        f"{base}object_budgets/templates": "Templates",
+        f"{base}invoices/line_items": "Line Items",
+        f"{base}taxes": "Taxes",
+        f"{base}contracts/types": "Contract Types"
         # Add more endpoints as needed
     }
 
-    # Encode client credentials to base64
+    # Encode client credentials to base64 (unchanged logic)
     client_credentials = f"{client_id}:{client_secret}"
     base64_credentials = base64.b64encode(client_credentials.encode()).decode()
 
@@ -62,36 +76,120 @@ try:
         "grant_type": "client_credentials"
     }
 
-    # Request access token
-    token_response = requests.post(token_endpoint, data=token_params, headers=token_headers)
+    # ──────────────────────────────────────────────────────────────────────────
+    # Robust requests session + backoff
+    # ──────────────────────────────────────────────────────────────────────────
+    def make_session(per_request_delay=0.35):
+        s = requests.Session()
+        retry = Retry(
+            total=10,
+            backoff_factor=1.2,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["GET", "POST"]),
+            respect_retry_after_header=True,
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        s.headers.update({"User-Agent": "AcceloFetcher/1.0"})
+        if per_request_delay > 0:
+            original = s.request
+            def delayed(method, url, **kw):
+                time.sleep(per_request_delay)
+                return original(method, url, **kw)
+            s.request = delayed
+        return s
+
+    def honor_retry_after(resp):
+        ra = resp.headers.get("Retry-After")
+        try:
+            wait = int(ra) if ra else 5
+        except Exception:
+            wait = 5
+        time.sleep(min(max(wait, 1), 120))
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Atomic CSV write (prevents partial files)
+    # ──────────────────────────────────────────────────────────────────────────
+    def atomic_write_csv(df: pd.DataFrame, final_path: str):
+        p = Path(final_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(p.suffix + ".part")
+        df.to_csv(tmp, index=False)
+        tmp.replace(p)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Super-light JSON checkpoints per endpoint/page
+    # ──────────────────────────────────────────────────────────────────────────
+    class PageCheckpoints:
+        """
+        Stores which pages are DONE per endpoint so reruns skip finished work.
+        File format:
+        {
+          "<endpoint_url>": {"done_pages": [0,1,2,...]}
+        }
+        """
+        def __init__(self, path):
+            self.path = path
+            self._data = {}
+            self._load()
+
+        def _load(self):
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    self._data = json.load(f)
+            except Exception:
+                self._data = {}
+
+        def _save(self):
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path + ".part"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.path)
+
+        def is_done(self, endpoint, page):
+            return page in set(self._data.get(endpoint, {}).get("done_pages", []))
+
+        def mark_done(self, endpoint, page):
+            e = self._data.setdefault(endpoint, {})
+            pages = set(e.get("done_pages", []))
+            pages.add(page)
+            e["done_pages"] = sorted(pages)
+            self._save()
+
+    # Request access token (using robust session)
+    session = make_session(per_request_delay=0.35)
+    token_response = session.post(token_endpoint, data=token_params, headers=token_headers, timeout=60)
 
     if token_response.status_code != 200:
         print(f"Access token request failed with status code {token_response.status_code}")
-        exit()
+        sys.exit(1)
 
     token_data = token_response.json()
     access_token = token_data.get("access_token")
 
     if not access_token:
         print("Access token not obtained.")
-        exit()
+        sys.exit(1)
 
     # Define the directory where CSV files will be saved
-    data_directory = "/home/sam.t/accelocron"
+    data_directory = r'/home/sam.t/accelocron'
+    Path(data_directory).mkdir(parents=True, exist_ok=True)
 
+    # Initialize checkpoints file
+    ckpt = PageCheckpoints(os.path.join(data_directory, "_accelo_page_checkpoints.json"))
 
-    # Function to convert columns with "date" in their names to date (without time)
+    # Helpers to massage columns
     def convert_columns_to_datetime(data):
         for column in data.columns:
             if 'date' in column.lower():
                 try:
-                    # Convert the Unix timestamp (seconds) to datetime
                     data[column] = pd.to_datetime(data[column], unit='s')
-                    # Format the datetime values as YYYY-MM-DD
                     data[column] = data[column].dt.strftime('%Y-%m-%d')
                 except Exception as e:
                     print(f"Error converting column {column} to date: {e}")
-
 
     def convert_columns_to_hours(data):
         for column in data.columns:
@@ -101,229 +199,206 @@ try:
                 except Exception as e:
                     print(f"Error converting column {column} to hours: {e}")
 
-
+    # Discover last page if count API is absent
     def binary_page_search(endpoint_url, access_token):
-        min_page, max_page = 0, 2 ** 20  # Using 2^20 as an arbitrary high number
+        min_page, max_page = 0, 2 ** 20
+        headers = {"Authorization": f"Bearer {access_token}"}
 
         while min_page < max_page:
             mid_page = (min_page + max_page) // 2
-
-            response = requests.get(
+            r = session.get(
                 f"{endpoint_url}?_page={mid_page}&_limit=100&_fields=_ALL",
-                headers={"Authorization": f"Bearer {access_token}"}
+                headers=headers, timeout=60
             )
 
-            if response.status_code == 200 and not response.json()["response"]:
+            if r.status_code == 429:
+                honor_retry_after(r)
+                continue
+
+            if r.status_code != 200:
+                # assume exists and move right slightly to avoid deadlock
+                min_page = mid_page + 1
+                continue
+
+            try:
+                payload = r.json()
+                empty = not payload.get("response")
+            except Exception:
+                empty = True
+
+            if empty:
                 max_page = mid_page
             else:
                 min_page = mid_page + 1
 
         return min_page
 
-
-    def transform_data(data):
-        """
-        Transforms the data for the Company Profiles endpoint.
-        """
-        # Create a DataFrame from the input data
-        df = pd.DataFrame(data)
-
-        # Use pivot_table to handle missing data and aggregation
-        df_pivot = pd.pivot_table(df, index='link_id', columns='field_name', values='value', aggfunc='first')
-
-        # Select only the desired columns that exist
-        desired_columns = ['Partner', 'Office_Responsible', 'Department']
-        df_filtered = df_pivot[desired_columns].dropna(how='all', axis=1)
-
-        return df_filtered
-
-
-    # Iterate through endpoints, which contains URL and folder name pairs
+    # ──────────────────────────────────────────────────────────────────────────
+    # FETCH: iterate endpoints and write per-page CSVs (atomic)
+    # ──────────────────────────────────────────────────────────────────────────
     for endpoint_url, folder_name in endpoints.items():
-        # Create a folder for the endpoint data
         save_directory = os.path.join(data_directory, folder_name)
         os.makedirs(save_directory, exist_ok=True)
 
-        # Request count of data for the current endpoint
         count_endpoint = f"{endpoint_url}/count"
-        count_response = requests.get(count_endpoint, headers={"Authorization": f"Bearer {access_token}"})
-        count_data = count_response.json()
+        count_response = session.get(count_endpoint, headers={"Authorization": f"Bearer {access_token}"}, timeout=60)
+        if count_response.status_code == 429:
+            honor_retry_after(count_response)
+            count_response = session.get(count_endpoint, headers={"Authorization": f"Bearer {access_token}"}, timeout=60)
+        count_data = count_response.json() if count_response.status_code == 200 else {}
 
-        # Check if count data is available in the response
         if "response" in count_data and "count" in count_data["response"]:
             data_count = int(count_data["response"]["count"])
-            total_pages = (data_count + 99) // 100  # Calculate total pages, rounding up
+            total_pages = (data_count + 99) // 100
             print(f"Total pages for {folder_name} data: {total_pages}")
         else:
-            # If count data is not available, use binary search to find the last page
-            print(
-                f"Count API Request for {folder_name} failed or did not provide count data. Using binary search to find the last page.")
+            print(f"Count API Request for {folder_name} failed or did not provide count data. Using binary search to find the last page.")
             total_pages = binary_page_search(endpoint_url, access_token)
             print(f"Total pages for {folder_name} data: {total_pages}")
 
         current_page = 0
         with tqdm(total=total_pages, desc=f"Processing {folder_name}") as progress_bar:
             while current_page < total_pages:
+                if ckpt.is_done(endpoint_url, current_page):
+                    progress_bar.update(1)
+                    current_page += 1
+                    continue
+
                 if endpoint_url == f"{base}activities":
-                    # Make a GET request to retrieve data with specific fields for activities
-                    response = requests.get(
+                    url = (
                         f"{endpoint_url}?_page={current_page}&_limit=100&_fields=subject,thread_id,contract_period_id,parent,nonbillable,against_id,"
                         f"rate_charged,date_started,date_logged,rate,visibility,invoice_id,class,time_allocation,standing,owner,activity_class,"
-                        f"against,date_modified,medium,id,activity_priority,date_created,parent_id,staff,owner_id,owner_type,thread,billable,priority",
-                        headers={"Authorization": f"Bearer {access_token}"},
+                        f"against,date_modified,medium,id,activity_priority,date_created,parent_id,staff,owner_id,owner_type,thread,billable,priority"
                     )
                 else:
-                    # Make a GET request to retrieve data with all fields for other endpoints
-                    response = requests.get(
-                        f"{endpoint_url}?_page={current_page}&_limit=100&_fields=_ALL",
-                        headers={"Authorization": f"Bearer {access_token}"},
-                    )
+                    url = f"{endpoint_url}?_page={current_page}&_limit=100&_fields=_ALL"
+
+                headers = {"Authorization": f"Bearer {access_token}"}
+                response = session.get(url, headers=headers, timeout=120)
+
+                if response.status_code == 429:
+                    honor_retry_after(response)
+                    response = session.get(url, headers=headers, timeout=120)
 
                 if response.status_code == 200:
-                    # Parse JSON response and process the data
-                    data = response.json()["response"]["expenses"] if endpoint_url == f"{base}expenses" else \
-                        response.json()["response"]
+                    resp_json = response.json()
+                    data = resp_json["response"]["expenses"] if endpoint_url == f"{base}expenses" else resp_json["response"]
 
-                    # Write the data to a CSV file
                     filename = f"{folder_name.lower()}_data_page_{current_page + 1}.csv"
                     file_path = os.path.join(save_directory, filename)
-                    pd.DataFrame(data).to_csv(file_path, index=False)
+                    atomic_write_csv(pd.DataFrame(data), file_path)
+
+                    ckpt.mark_done(endpoint_url, current_page)
                     current_page += 1
                     progress_bar.update(1)
                 else:
-                    # Handle API request failure
                     print(f"API Request failed with status code {response.status_code}")
                     break
 
-
-    # Merge CSV files for each endpoint
+    # ──────────────────────────────────────────────────────────────────────────
+    # MERGE: combine each endpoint's CSV pages into a single merged CSV
+    # ──────────────────────────────────────────────────────────────────────────
     def merge_csv_files(endpoint_name, folder_name):
         print(f"Started processing {endpoint_name}")
-        merged_data = pd.DataFrame()  # Initialize an empty DataFrame
+        merged_data = pd.DataFrame()
 
-        # Define the directory path for this endpoint
         endpoint_directory = os.path.join(data_directory, folder_name)
-
-        # Check if the directory exists
         if not os.path.exists(endpoint_directory):
             print(f"Directory not found for {endpoint_name}")
             return
 
-        # Iterate through the files in the directory
         for filename in os.listdir(endpoint_directory):
             if filename.endswith(".csv"):
                 file_path = os.path.join(endpoint_directory, filename)
-
                 print(f"FILEPATH: {file_path}")
 
                 try:
-                    # Read the CSV file and append it to the merged_data DataFrame
                     data = pd.read_csv(file_path, sep=",")
-
-                    # Convert columns with "date" in their names to datetime
                     convert_columns_to_datetime(data)
                     merged_data = pd.concat([merged_data, data], ignore_index=True)
                 except EmptyDataError:
                     pass
 
-        # Define the path for the merged CSV file
         merged_file_path = os.path.join(data_directory, f"{folder_name}_merged.csv")
-
-        # Save the merged data to a CSV file
         merged_data.to_csv(merged_file_path, index=False)
         print(f"Merged data for {endpoint_name} into {merged_file_path}")
 
-
-    # Merge CSV files for each endpoint
     for endpoint_url, folder_name in endpoints.items():
         merge_csv_files(endpoint_url.split("/")[-1], folder_name)
 
-
-    def transform_data(data_file, desired_columns):
+    # ──────────────────────────────────────────────────────────────────────────
+    # TRANSFORM (Company Profiles ONLY): restore original pivot behavior
+    # ──────────────────────────────────────────────────────────────────────────
+    def transform_company_profiles(data_directory):
         """
-        Transforms the merged data.
-
-        Args:
-        - data_file (str): Path to the CSV file containing the merged data.
-        - desired_columns (list): List of column names to include in the transformed DataFrame.
-
-        Returns:
-        - pd.DataFrame: Transformed DataFrame with selected columns.
+        Reads 'Company Profiles_merged.csv', pivots field_name -> columns, and keeps:
+        ['Partner','Office_Responsible','Department'] if present. Overwrites same file.
         """
-        try:
-            # Read the merged data from the CSV file
-            data = pd.read_csv(data_file)
-
-            # Print columns in the data
-            print(f"Columns in the data:\n{data.columns}")
-
-            # Filter the DataFrame to include only the desired columns
-            filtered_data = data[desired_columns]
-
-            # Pivot the table to create columns for each unique 'field_name'
-            pivot_table = pd.pivot_table(filtered_data, index=['link_id'], columns='field_name', values='value',
-                                         aggfunc='first').reset_index()
-
-            # Save the transformed data back to the CSV file
-            pivot_table.to_csv(data_file, index=False)
-
-            return pivot_table
-
-        except Exception as e:
-            print(f"Error: {e}. Skipping transformation for {data_file}")
+        merged_file = os.path.join(data_directory, "Company Profiles_merged.csv")
+        if not os.path.exists(merged_file):
+            print("Company Profiles merged file not found:", merged_file)
             return None
 
+        try:
+            df = pd.read_csv(merged_file)
 
-    # Example usage:
-    data_file_path = '/home/sam.t/accelocron/Company Profiles_merged.csv'
-    desired_columns_companies = ['link_id', 'field_name', 'value']
-    transformed_data_companies = transform_data(data_file_path, desired_columns_companies)
+            # Required columns for the pivot
+            required = {"link_id", "field_name", "value"}
+            missing = required - set(df.columns)
+            if missing:
+                print(f"Error: Missing required columns for pivot: {missing}")
+                return None
 
-    # # Example usage for a different dataset:
-    # data_file_path_contracts = './data/API FIle/Contracts Profiles_merged.csv'
-    # desired_columns_contracts = ['link_id', 'field_name', 'value']
-    # transformed_data_contracts = transform_data(data_file_path_contracts, desired_columns_contracts)
-    #
-    # data_file_path_issues = 'C:/API FIle/Issues Profiles_merged.csv'
-    # desired_columns_issues = ['link_id', 'field_name', 'value']
-    # transformed_data_issues = transform_data(data_file_path_issues, desired_columns_issues)
+            # Pivot to wide format
+            pivot = pd.pivot_table(
+                df[["link_id", "field_name", "value"]],
+                index="link_id",
+                columns="field_name",
+                values="value",
+                aggfunc="first"
+            ).reset_index()
 
+            # Keep only desired columns that exist
+            desired = ["Partner", "Office_Responsible", "Department"]
+            keep = ["link_id"] + [c for c in desired if c in pivot.columns]
+            if len(keep) == 1:
+                print("Warning: none of the desired columns were found in the pivot.")
+            pivot = pivot[keep]
 
-    # Function to export merged CSV data to PostgreSQLL
+            # Overwrite merged file with transformed data (old behavior)
+            pivot.to_csv(merged_file, index=False)
+            print(f"Transformed Company Profiles written to: {merged_file}")
+            return pivot
+
+        except Exception as e:
+            print(f"Error transforming Company Profiles: {e}")
+            return None
+
+    # Run the Company Profiles transform once
+    transform_company_profiles(data_directory)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # EXPORT: push merged (and transformed) CSVs to PostgreSQL
+    # ──────────────────────────────────────────────────────────────────────────
     def export_merged_csv_to_postgresql(data_directory, folder_name):
         # Create a SQLAlchemy engine
         engine = create_engine(f'postgresql://dashboardadmin:Calgary20!#@kpidashdb.postgres.database.azure.com:5432/kpidashboard')
 
-#'postgresql://dashboardadmin:Calgary20%40%23@pkfresourcedb.postgres.database.azure.com:5432/postgres') #azure
-#'postgresql://pbk_admin:{db_master}:6p@24.144.94.16:5432/resource_db')
-#            f'postgresql://doadmin:AVNS_5H7J5toQ6bb_9ebZI2o@db-postgresql-sfo3-dwh-do-user-14386803-0.c.db.ondigitalocean.com:25060/defaultdb?sslmode=require'
-#        )
-
-        # Define the path for the merged CSV file
         merged_file_path = os.path.join(data_directory, f"{folder_name}_merged.csv")
-
-        # Check if the merged file exists
         if not os.path.exists(merged_file_path):
             print(f"Merged file not found for {folder_name}")
             return
 
-        # Read the merged CSV file
         data = pd.read_csv(merged_file_path)
-
-        # Convert columns with "date" in their names to datetime
         convert_columns_to_datetime(data)
-
-        # Convert columns with "billable" in their names to hours
         convert_columns_to_hours(data)
 
-        # Export the data to the PostgreSQL database
-        table_name = f"{folder_name.lower()}_data"  # Define a table name based on folder_name
+        table_name = f"{folder_name.lower()}_data"
         data.to_sql(table_name, engine, if_exists='replace', index=False)
 
         print(f"Exported merged data for {folder_name} to {table_name} in PostgreSQL database")
 
-
-    # Example usage:
+    # Export (unchanged list)
     export_merged_csv_to_postgresql(data_directory, "Invoices")
     export_merged_csv_to_postgresql(data_directory, "Staff")
     export_merged_csv_to_postgresql(data_directory, "Jobs")
@@ -343,11 +418,8 @@ try:
     export_merged_csv_to_postgresql(data_directory, "Memberships")
     export_merged_csv_to_postgresql(data_directory, "Groups")
     export_merged_csv_to_postgresql(data_directory, "Contract Periods")
-    export_merged_csv_to_postgresql(data_directory, "Resources")
     pass
+
 except Exception as e:
     print(f"Error: {e}", file=sys.stderr)
     sys.exit(1)  # Exit with a non-zero status code in case of an error
-
-
-
