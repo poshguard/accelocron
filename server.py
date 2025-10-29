@@ -359,11 +359,11 @@ try:
             ).reset_index()
 
             # Keep only desired columns that exist
-            desired = ["Partner", "Office_Responsible", "Department"]
-            keep = ["link_id"] + [c for c in desired if c in pivot.columns]
-            if len(keep) == 1:
-                print("Warning: none of the desired columns were found in the pivot.")
-            pivot = pivot[keep]
+            #desired = ["Partner", "Office_Responsible", "Department"]
+            #keep = ["link_id"] + [c for c in desired if c in pivot.columns]
+            #if len(keep) == 1:
+                #print("Warning: none of the desired columns were found in the pivot.")
+            #pivot = pivot[keep]
 
             # Overwrite merged file with transformed data (old behavior)
             pivot.to_csv(merged_file, index=False)
