@@ -384,7 +384,7 @@ try:
     # ──────────────────────────────────────────────────────────────────────────
     def export_merged_csv_to_postgresql(data_directory, folder_name):
         # Create a SQLAlchemy engine
-        engine = create_engine(f'postgresql://dashboardadmin:Calgary20!#@kpidashdb.postgres.database.azure.com:5432/kpidashboard')
+        engine = create_engine(f'postgresql://dashboardadmin:Calgary2025!#@kpidashdb.postgres.database.azure.com:5432/kpidashboard')
 
         merged_file_path = os.path.join(data_directory, f"{folder_name}_merged.csv")
         if not os.path.exists(merged_file_path):
