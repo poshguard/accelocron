@@ -176,7 +176,7 @@ try:
         sys.exit(1)
 
     # Define the directory where CSV files will be saved
-    data_directory = r'/home/sam.t/accelocron'
+    data_directory = r'/home/azureuser/accelocron'
     Path(data_directory).mkdir(parents=True, exist_ok=True)
 
     # Initialize checkpoints file
