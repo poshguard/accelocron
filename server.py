@@ -1,427 +1,405 @@
-#developed by pkf
-#1.0
-import base64
-import logging
+# developed by pkf
+# refresh_accelo_all.py
+
 import os
+import sys
 import time
 import json
-from pathlib import Path
-import sqlite3  # (unused; safe to keep/remove)
+import logging
+
 import requests
 import pandas as pd
 from dotenv import load_dotenv, find_dotenv
-from pandas.errors import EmptyDataError
 from sqlalchemy import create_engine
-from tqdm import tqdm
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import sys
+from tqdm import tqdm
 
-try:
-    # ──────────────────────────────────────────────────────────────────────────
-    # Logging
-    # ──────────────────────────────────────────────────────────────────────────
-    logging.basicConfig()
-    logging.getLogger('sqlalchemy.engine').setLevel(logging.INFO)
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.INFO)
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
+def make_session(per_request_delay: float = 0.35) -> requests.Session:
+    """Return requests.Session with retries and optional delay."""
+    s = requests.Session()
+    retry = Retry(
+        total=10,
+        backoff_factor=1.2,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET", "POST"}),
+        respect_retry_after_header=True,
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    s.headers.update({"User-Agent": "AcceloRefresh/1.0"})
+
+    if per_request_delay > 0:
+        orig_req = s.request
+
+        def delayed(method, url, **kw):
+            time.sleep(per_request_delay)
+            return orig_req(method, url, **kw)
+
+        s.request = delayed
+
+    return s
+
+
+def honor_retry_after(resp: requests.Response) -> None:
+    """Sleep according to Retry-After header when rate limited."""
+    ra = resp.headers.get("Retry-After")
+    try:
+        wait = int(ra) if ra else 5
+    except Exception:
+        wait = 5
+    wait = max(1, min(wait, 120))
+    logger.warning("Rate limited, sleeping for %s seconds…", wait)
+    time.sleep(wait)
+
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+def get_access_token(
+    session: requests.Session,
+    token_endpoint: str,
+    client_id: str,
+    client_secret: str,
+) -> str:
+    """Request OAuth2 client_credentials token."""
+    import base64
+
+    creds = f"{client_id}:{client_secret}"
+    b64 = base64.b64encode(creds.encode()).decode()
+    headers = {"Authorization": f"Basic {b64}"}
+    data = {"grant_type": "client_credentials"}
+
+    r = session.post(token_endpoint, headers=headers, data=data, timeout=60)
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"Token request failed: {r.status_code} {r.text[:500]}"
+        )
+
+    token = r.json().get("access_token")
+    if not token:
+        raise RuntimeError("No access_token in token response")
+    return token
+
+
+# ---------------------------------------------------------------------------
+# Pagination helpers
+# ---------------------------------------------------------------------------
+def binary_page_search(
+    session: requests.Session,
+    endpoint_url: str,
+    token: str,
+    limit: int = 100,
+) -> int:
+    """Find last page when /count is not available."""
+    headers = {"Authorization": f"Bearer {token}"}
+    low, high = 0, 2**20
+
+    while low < high:
+        mid = (low + high) // 2
+        url = f"{endpoint_url}?_page={mid}&_limit={limit}&_fields=_ALL"
+        r = session.get(url, headers=headers, timeout=60)
+
+        if r.status_code == 429:
+            honor_retry_after(r)
+            continue
+
+        if r.status_code != 200:
+            low = mid + 1
+            continue
+
+        try:
+            payload = r.json()
+            empty = not payload.get("response")
+        except Exception:
+            empty = True
+
+        if empty:
+            high = mid
+        else:
+            low = mid + 1
+
+    return low
+
+
+def get_total_pages(
+    session: requests.Session,
+    endpoint_url: str,
+    token: str,
+    limit: int = 100,
+) -> int:
+    """Return number of pages using /count or binary search fallback."""
+    headers = {"Authorization": f"Bearer {token}"}
+    count_url = f"{endpoint_url}/count"
+
+    r = session.get(count_url, headers=headers, timeout=60)
+    if r.status_code == 429:
+        honor_retry_after(r)
+        r = session.get(count_url, headers=headers, timeout=60)
+
+    if r.status_code == 200:
+        try:
+            j = r.json()
+            count = int(j.get("response", {}).get("count", 0))
+        except Exception:
+            count = 0
+    else:
+        count = 0
+
+    if count <= 0:
+        pages = binary_page_search(session, endpoint_url, token, limit=limit)
+        logger.info(
+            "Count not available for %s, using binary search pages=%s",
+            endpoint_url,
+            pages,
+        )
+        return pages
+
+    pages = (count + limit - 1) // limit
+    logger.info("Endpoint %s: count=%s, pages=%s", endpoint_url, count, pages)
+    return pages
+
+
+# ---------------------------------------------------------------------------
+# Converters
+# ---------------------------------------------------------------------------
+def convert_date_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert all *date* columns from unix seconds to YYYY-MM-DD."""
+    for col in df.columns:
+        if "date" in col.lower():
+            try:
+                df[col] = pd.to_datetime(df[col], unit="s", errors="coerce")
+                df[col] = df[col].dt.strftime("%Y-%m-%d")
+            except Exception as e:
+                logger.warning("Date convert failed for %s: %s", col, e)
+    return df
+
+
+def convert_activities_hours(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert billable-related columns from seconds to hours.
+
+    This follows the original logic: columns containing 'billable'
+    in their name are divided by 3600.0.
+    """
+    for col in df.columns:
+        if "billable" in col.lower():
+            try:
+                df[col] = pd.to_numeric(df[col], errors="coerce") / 3600.0
+            except Exception as e:
+                logger.warning("Hour convert failed for %s: %s", col, e)
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Fetchers
+# ---------------------------------------------------------------------------
+def fetch_generic(
+    session: requests.Session,
+    endpoint_url: str,
+    token: str,
+    limit: int = 100,
+    extra_response_key: str | None = None,
+    fields: str = "_ALL",
+) -> pd.DataFrame:
+    """Fetch all pages for a generic endpoint into a DataFrame."""
+    headers = {"Authorization": f"Bearer {token}"}
+    pages = get_total_pages(session, endpoint_url, token, limit=limit)
+
+    all_rows: list[dict] = []
+    desc = endpoint_url.split("/")[-1] or endpoint_url
+
+    with tqdm(total=pages, desc=f"Downloading {desc}") as bar:
+        for page in range(0, pages):
+            url = (
+                f"{endpoint_url}?_page={page}"
+                f"&_limit={limit}&_fields={fields}"
+            )
+            r = session.get(url, headers=headers, timeout=120)
+            if r.status_code == 429:
+                honor_retry_after(r)
+                r = session.get(url, headers=headers, timeout=120)
+
+            if r.status_code != 200:
+                raise RuntimeError(
+                    f"Endpoint {endpoint_url} page {page} failed: "
+                    f"{r.status_code} {r.text[:500]}"
+                )
+
+            j = r.json()
+            resp = j.get("response", [])
+            if extra_response_key:
+                resp = j.get("response", {}).get(extra_response_key, [])
+
+            if not isinstance(resp, list):
+                raise RuntimeError(
+                    f"Unexpected response format on page {page}: {json.dumps(j)[:500]}"
+                )
+
+            all_rows.extend(resp)
+            bar.update(1)
+
+    if not all_rows:
+        logger.warning("No rows downloaded for %s", endpoint_url)
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows)
+    logger.info(
+        "Endpoint %s: downloaded %s rows", endpoint_url, len(df)
+    )
+    return df
+
+
+def fetch_activities(
+    session: requests.Session,
+    activities_url: str,
+    token: str,
+    limit: int = 100,
+) -> pd.DataFrame:
+    """Fetch activities with explicit field list."""
+    fields = (
+        "subject,thread_id,contract_period_id,parent,nonbillable,against_id,"
+        "rate_charged,date_started,date_logged,rate,visibility,invoice_id,"
+        "class,time_allocation,standing,owner,activity_class,against,"
+        "date_modified,medium,id,activity_priority,date_created,parent_id,"
+        "staff,owner_id,owner_type,thread,billable,priority"
+    )
+    df = fetch_generic(
+        session=session,
+        endpoint_url=activities_url,
+        token=token,
+        limit=limit,
+        extra_response_key=None,
+        fields=fields,
+    )
+    df = convert_date_columns(df)
+    df = convert_activities_hours(df)
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Export
+# ---------------------------------------------------------------------------
+def export_df_to_postgres(
+    df: pd.DataFrame,
+    db_master_url: str,
+    table_name: str,
+) -> None:
+    """Write DataFrame to PostgreSQL, replacing existing table."""
+    if df is None or df.empty:
+        logger.warning(
+            "Table %s: DataFrame is empty, skipping export", table_name
+        )
+        return
+
+    if not db_master_url:
+        raise RuntimeError("DB_MASTER is not set")
+
+    engine = create_engine(db_master_url)
+    logger.info(
+        "Writing %s rows to table %s", len(df), table_name
+    )
+
+    df.to_sql(
+        table_name,
+        engine,
+        if_exists="replace",
+        index=False,
+        method="multi",
+        chunksize=1000,
+    )
+    logger.info("Export to %s completed", table_name)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main():
     load_dotenv(find_dotenv())
 
-    # Credentials and endpoints
     client_id = os.getenv("CLIENT_ID")
     client_secret = os.getenv("CLIENT_SECRET")
     token_endpoint = os.getenv("BASE_URL")
     base = os.getenv("BASE")
     db_master = os.getenv("DB_MASTER")
 
-    endpoints = {
-        f"{base}staff": "Staff",
-        f"{base}rates": "Rates",
-        f"{base}jobs": "Jobs",
-        f"{base}invoices": "Invoices",
-        f"{base}companies": "Companies",
-        f"{base}issues": "Issues",
-        f"{base}affiliations": "Affiliations",
-        f"{base}milestones": "Milestones",
-        f"{base}contracts": "Contracts",
-        f"{base}companies/profiles/values": "Company Profiles",
-        f"{base}issues/profiles/values": "Issues Profiles",
-        f"{base}jobs/profiles/values": "Jobs Profiles",
-        f"{base}expenses": "Expenses",
-        f"{base}contracts/profiles/values": "Contracts Profiles",
-        f"{base}contracts/periods": "Contract Periods",
-        f"{base}activities": "Activities",
-        f"{base}tasks": "Tasks",
-        f"{base}groups": "Groups",
-        f"{base}staff/memberships": "Memberships",
-        f"{base}object_budgets/services": "Services",
-        f"{base}object_budgets/materials": "Materials",
-        f"{base}object_budgets/templates": "Templates",
-        f"{base}invoices/line_items": "Line Items",
-        f"{base}taxes": "Taxes",
-        f"{base}contracts/types": "Contract Types"
-        # Add more endpoints as needed
-    }
-
-    # Encode client credentials to base64 (unchanged logic)
-    client_credentials = f"{client_id}:{client_secret}"
-    base64_credentials = base64.b64encode(client_credentials.encode()).decode()
-
-    # Prepare headers for token request
-    token_headers = {
-        "Authorization": f"Basic {base64_credentials}"
-    }
-
-    # Token request parameters
-    token_params = {
-        "grant_type": "client_credentials"
-    }
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Robust requests session + backoff
-    # ──────────────────────────────────────────────────────────────────────────
-    def make_session(per_request_delay=0.35):
-        s = requests.Session()
-        retry = Retry(
-            total=10,
-            backoff_factor=1.2,
-            status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=frozenset(["GET", "POST"]),
-            respect_retry_after_header=True,
-            raise_on_status=False,
+    if not all([client_id, client_secret, token_endpoint, base, db_master]):
+        raise RuntimeError(
+            "Please set CLIENT_ID, CLIENT_SECRET, BASE_URL, BASE and DB_MASTER in .env"
         )
-        adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
-        s.mount("https://", adapter)
-        s.mount("http://", adapter)
-        s.headers.update({"User-Agent": "AcceloFetcher/1.0"})
-        if per_request_delay > 0:
-            original = s.request
-            def delayed(method, url, **kw):
-                time.sleep(per_request_delay)
-                return original(method, url, **kw)
-            s.request = delayed
-        return s
 
-    def honor_retry_after(resp):
-        ra = resp.headers.get("Retry-After")
-        try:
-            wait = int(ra) if ra else 5
-        except Exception:
-            wait = 5
-        time.sleep(min(max(wait, 1), 120))
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Atomic CSV write (prevents partial files)
-    # ──────────────────────────────────────────────────────────────────────────
-    def atomic_write_csv(df: pd.DataFrame, final_path: str):
-        p = Path(final_path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(p.suffix + ".part")
-        df.to_csv(tmp, index=False)
-        tmp.replace(p)
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Super-light JSON checkpoints per endpoint/page
-    # ──────────────────────────────────────────────────────────────────────────
-    class PageCheckpoints:
-        """
-        Stores which pages are DONE per endpoint so reruns skip finished work.
-        File format:
-        {
-          "<endpoint_url>": {"done_pages": [0,1,2,...]}
-        }
-        """
-        def __init__(self, path):
-            self.path = path
-            self._data = {}
-            self._load()
-
-        def _load(self):
-            try:
-                with open(self.path, "r", encoding="utf-8") as f:
-                    self._data = json.load(f)
-            except Exception:
-                self._data = {}
-
-        def _save(self):
-            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path + ".part"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self._data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, self.path)
-
-        def is_done(self, endpoint, page):
-            return page in set(self._data.get(endpoint, {}).get("done_pages", []))
-
-        def mark_done(self, endpoint, page):
-            e = self._data.setdefault(endpoint, {})
-            pages = set(e.get("done_pages", []))
-            pages.add(page)
-            e["done_pages"] = sorted(pages)
-            self._save()
-
-    # Request access token (using robust session)
     session = make_session(per_request_delay=0.35)
-    token_response = session.post(token_endpoint, data=token_params, headers=token_headers, timeout=60)
+    token = get_access_token(session, token_endpoint, client_id, client_secret)
 
-    if token_response.status_code != 200:
-        print(f"Access token request failed with status code {token_response.status_code}")
-        sys.exit(1)
+    # Endpoint configuration: (url, table_name, extra_response_key, use_activity_logic)
+    endpoints = [
+        (f"{base}invoices", "invoices_data", None, False),
+        (f"{base}staff", "staff_data", None, False),
+        (f"{base}jobs", "jobs_data", None, False),
+        (f"{base}expenses", "expenses_data", "expenses", False),
+        (f"{base}rates", "rates_data", None, False),
+        (f"{base}activities", "activities_data", None, True),
+        (f"{base}companies", "companies_data", None, False),
+        (f"{base}affiliations", "affiliations_data", None, False),
+        (f"{base}issues", "issues_data", None, False),
+        (f"{base}milestones", "milestones_data", None, False),
+        (f"{base}contracts", "contracts_data", None, False),
+        (f"{base}contracts/profiles/values", "contracts_profiles_data", None, False),
+        (f"{base}companies/profiles/values", "company_profiles_data", None, False),
+        (f"{base}issues/profiles/values", "issues_profiles_data", None, False),
+        (f"{base}jobs/profiles/values", "jobs_profiles_data", None, False),
+        (f"{base}tasks", "tasks_data", None, False),
+        (f"{base}staff/memberships", "memberships_data", None, False),
+        (f"{base}groups", "groups_data", None, False),
+        (f"{base}contracts/periods", "contract_periods_data", None, False),
+        (f"{base}object_budgets/services", "services_data", None, False),
+        (f"{base}object_budgets/materials", "materials_data", None, False),
+        (f"{base}object_budgets/templates", "templates_data", None, False),
+        (f"{base}invoices/line_items", "line_items_data", None, False),
+        (f"{base}taxes", "taxes_data", None, False),
+        (f"{base}contracts/types", "contract_types_data", None, False),
+    ]
 
-    token_data = token_response.json()
-    access_token = token_data.get("access_token")
-
-    if not access_token:
-        print("Access token not obtained.")
-        sys.exit(1)
-
-    # Define the directory where CSV files will be saved
-    data_directory = r'/home/azureuser/accelocron'
-    Path(data_directory).mkdir(parents=True, exist_ok=True)
-
-    # Initialize checkpoints file
-    ckpt = PageCheckpoints(os.path.join(data_directory, "_accelo_page_checkpoints.json"))
-
-    # Helpers to massage columns
-    def convert_columns_to_datetime(data):
-        for column in data.columns:
-            if 'date' in column.lower():
-                try:
-                    data[column] = pd.to_datetime(data[column], unit='s')
-                    data[column] = data[column].dt.strftime('%Y-%m-%d')
-                except Exception as e:
-                    print(f"Error converting column {column} to date: {e}")
-
-    def convert_columns_to_hours(data):
-        for column in data.columns:
-            if 'billable' in column.lower():
-                try:
-                    data[column] = data[column] / 3600.0  # Convert seconds to hours
-                except Exception as e:
-                    print(f"Error converting column {column} to hours: {e}")
-
-    # Discover last page if count API is absent
-    def binary_page_search(endpoint_url, access_token):
-        min_page, max_page = 0, 2 ** 20
-        headers = {"Authorization": f"Bearer {access_token}"}
-
-        while min_page < max_page:
-            mid_page = (min_page + max_page) // 2
-            r = session.get(
-                f"{endpoint_url}?_page={mid_page}&_limit=100&_fields=_ALL",
-                headers=headers, timeout=60
-            )
-
-            if r.status_code == 429:
-                honor_retry_after(r)
-                continue
-
-            if r.status_code != 200:
-                # assume exists and move right slightly to avoid deadlock
-                min_page = mid_page + 1
-                continue
-
-            try:
-                payload = r.json()
-                empty = not payload.get("response")
-            except Exception:
-                empty = True
-
-            if empty:
-                max_page = mid_page
-            else:
-                min_page = mid_page + 1
-
-        return min_page
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # FETCH: iterate endpoints and write per-page CSVs (atomic)
-    # ──────────────────────────────────────────────────────────────────────────
-    for endpoint_url, folder_name in endpoints.items():
-        save_directory = os.path.join(data_directory, folder_name)
-        os.makedirs(save_directory, exist_ok=True)
-
-        count_endpoint = f"{endpoint_url}/count"
-        count_response = session.get(count_endpoint, headers={"Authorization": f"Bearer {access_token}"}, timeout=60)
-        if count_response.status_code == 429:
-            honor_retry_after(count_response)
-            count_response = session.get(count_endpoint, headers={"Authorization": f"Bearer {access_token}"}, timeout=60)
-        count_data = count_response.json() if count_response.status_code == 200 else {}
-
-        if "response" in count_data and "count" in count_data["response"]:
-            data_count = int(count_data["response"]["count"])
-            total_pages = (data_count + 99) // 100
-            print(f"Total pages for {folder_name} data: {total_pages}")
-        else:
-            print(f"Count API Request for {folder_name} failed or did not provide count data. Using binary search to find the last page.")
-            total_pages = binary_page_search(endpoint_url, access_token)
-            print(f"Total pages for {folder_name} data: {total_pages}")
-
-        current_page = 0
-        with tqdm(total=total_pages, desc=f"Processing {folder_name}") as progress_bar:
-            while current_page < total_pages:
-                if ckpt.is_done(endpoint_url, current_page):
-                    progress_bar.update(1)
-                    current_page += 1
-                    continue
-
-                if endpoint_url == f"{base}activities":
-                    url = (
-                        f"{endpoint_url}?_page={current_page}&_limit=100&_fields=subject,thread_id,contract_period_id,parent,nonbillable,against_id,"
-                        f"rate_charged,date_started,date_logged,rate,visibility,invoice_id,class,time_allocation,standing,owner,activity_class,"
-                        f"against,date_modified,medium,id,activity_priority,date_created,parent_id,staff,owner_id,owner_type,thread,billable,priority"
-                    )
-                else:
-                    url = f"{endpoint_url}?_page={current_page}&_limit=100&_fields=_ALL"
-
-                headers = {"Authorization": f"Bearer {access_token}"}
-                response = session.get(url, headers=headers, timeout=120)
-
-                if response.status_code == 429:
-                    honor_retry_after(response)
-                    response = session.get(url, headers=headers, timeout=120)
-
-                if response.status_code == 200:
-                    resp_json = response.json()
-                    data = resp_json["response"]["expenses"] if endpoint_url == f"{base}expenses" else resp_json["response"]
-
-                    filename = f"{folder_name.lower()}_data_page_{current_page + 1}.csv"
-                    file_path = os.path.join(save_directory, filename)
-                    atomic_write_csv(pd.DataFrame(data), file_path)
-
-                    ckpt.mark_done(endpoint_url, current_page)
-                    current_page += 1
-                    progress_bar.update(1)
-                else:
-                    print(f"API Request failed with status code {response.status_code}")
-                    break
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # MERGE: combine each endpoint's CSV pages into a single merged CSV
-    # ──────────────────────────────────────────────────────────────────────────
-    def merge_csv_files(endpoint_name, folder_name):
-        print(f"Started processing {endpoint_name}")
-        merged_data = pd.DataFrame()
-
-        endpoint_directory = os.path.join(data_directory, folder_name)
-        if not os.path.exists(endpoint_directory):
-            print(f"Directory not found for {endpoint_name}")
-            return
-
-        for filename in os.listdir(endpoint_directory):
-            if filename.endswith(".csv"):
-                file_path = os.path.join(endpoint_directory, filename)
-                print(f"FILEPATH: {file_path}")
-
-                try:
-                    data = pd.read_csv(file_path, sep=",")
-                    convert_columns_to_datetime(data)
-                    merged_data = pd.concat([merged_data, data], ignore_index=True)
-                except EmptyDataError:
-                    pass
-
-        merged_file_path = os.path.join(data_directory, f"{folder_name}_merged.csv")
-        merged_data.to_csv(merged_file_path, index=False)
-        print(f"Merged data for {endpoint_name} into {merged_file_path}")
-
-    for endpoint_url, folder_name in endpoints.items():
-        merge_csv_files(endpoint_url.split("/")[-1], folder_name)
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # TRANSFORM (Company Profiles ONLY): restore original pivot behavior
-    # ──────────────────────────────────────────────────────────────────────────
-    def transform_company_profiles(data_directory):
-        """
-        Reads 'Company Profiles_merged.csv', pivots field_name -> columns, and keeps:
-        ['Partner','Office_Responsible','Department'] if present. Overwrites same file.
-        """
-        merged_file = os.path.join(data_directory, "Company Profiles_merged.csv")
-        if not os.path.exists(merged_file):
-            print("Company Profiles merged file not found:", merged_file)
-            return None
-
+    for url, table, extra_key, is_activities in endpoints:
         try:
-            df = pd.read_csv(merged_file)
+            logger.info("Processing endpoint %s → table %s", url, table)
 
-            # Required columns for the pivot
-            required = {"link_id", "field_name", "value"}
-            missing = required - set(df.columns)
-            if missing:
-                print(f"Error: Missing required columns for pivot: {missing}")
-                return None
+            if is_activities:
+                df = fetch_activities(session, url, token, limit=100)
+            else:
+                df = fetch_generic(
+                    session=session,
+                    endpoint_url=url,
+                    token=token,
+                    limit=100,
+                    extra_response_key=extra_key,
+                    fields="_ALL",
+                )
+                df = convert_date_columns(df)
 
-            # Pivot to wide format
-            pivot = pd.pivot_table(
-                df[["link_id", "field_name", "value"]],
-                index="link_id",
-                columns="field_name",
-                values="value",
-                aggfunc="first"
-            ).reset_index()
-
-            # Keep only desired columns that exist
-            #desired = ["Partner", "Office_Responsible", "Department"]
-            #keep = ["link_id"] + [c for c in desired if c in pivot.columns]
-            #if len(keep) == 1:
-                #print("Warning: none of the desired columns were found in the pivot.")
-            #pivot = pivot[keep]
-
-            # Overwrite merged file with transformed data (old behavior)
-            pivot.to_csv(merged_file, index=False)
-            print(f"Transformed Company Profiles written to: {merged_file}")
-            return pivot
+            export_df_to_postgres(df, db_master, table)
 
         except Exception as e:
-            print(f"Error transforming Company Profiles: {e}")
-            return None
+            logger.exception(
+                "Failed processing endpoint %s → table %s: %s", url, table, e
+            )
 
-    # Run the Company Profiles transform once
-    transform_company_profiles(data_directory)
+    logger.info("All endpoints processed.")
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # EXPORT: push merged (and transformed) CSVs to PostgreSQL
-    # ──────────────────────────────────────────────────────────────────────────
-    def export_merged_csv_to_postgresql(data_directory, folder_name):
-        # Create a SQLAlchemy engine
-        engine = create_engine(f'postgresql://dashboardadmin:Calgary!#@kpidashdb.postgres.database.azure.com:5432/kpidashboard')
 
-        merged_file_path = os.path.join(data_directory, f"{folder_name}_merged.csv")
-        if not os.path.exists(merged_file_path):
-            print(f"Merged file not found for {folder_name}")
-            return
-
-        data = pd.read_csv(merged_file_path)
-        convert_columns_to_datetime(data)
-        convert_columns_to_hours(data)
-
-        table_name = f"{folder_name.lower()}_data"
-        data.to_sql(table_name, engine, if_exists='replace', index=False)
-
-        print(f"Exported merged data for {folder_name} to {table_name} in PostgreSQL database")
-
-    # Export (unchanged list)
-    export_merged_csv_to_postgresql(data_directory, "Invoices")
-    export_merged_csv_to_postgresql(data_directory, "Staff")
-    export_merged_csv_to_postgresql(data_directory, "Jobs")
-    export_merged_csv_to_postgresql(data_directory, "Expenses")
-    export_merged_csv_to_postgresql(data_directory, "Rates")
-    export_merged_csv_to_postgresql(data_directory, "Activities")
-    export_merged_csv_to_postgresql(data_directory, "Companies")
-    export_merged_csv_to_postgresql(data_directory, "Affiliations")
-    export_merged_csv_to_postgresql(data_directory, "Issues")
-    export_merged_csv_to_postgresql(data_directory, "Milestones")
-    export_merged_csv_to_postgresql(data_directory, "Contracts")
-    export_merged_csv_to_postgresql(data_directory, "Contracts Profiles")
-    export_merged_csv_to_postgresql(data_directory, "Company Profiles")
-    export_merged_csv_to_postgresql(data_directory, "Issues Profiles")
-    export_merged_csv_to_postgresql(data_directory, "Jobs Profiles")
-    export_merged_csv_to_postgresql(data_directory, "Tasks")
-    export_merged_csv_to_postgresql(data_directory, "Memberships")
-    export_merged_csv_to_postgresql(data_directory, "Groups")
-    export_merged_csv_to_postgresql(data_directory, "Contract Periods")
-    pass
-
-except Exception as e:
-    print(f"Error: {e}", file=sys.stderr)
-    sys.exit(1)  # Exit with a non-zero status code in case of an error
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        logger.exception("Fatal error: %s", e)
+        sys.exit(1)
