@@ -1,5 +1,5 @@
 # developed by pkf
-# refresh_accelo_all.py
+# server.py
 
 import os
 import sys
@@ -174,26 +174,90 @@ def get_total_pages(
 # Converters
 # ---------------------------------------------------------------------------
 def convert_date_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Convert all *date* columns from unix seconds to YYYY-MM-DD."""
+    """
+    Convert all columns whose name contains 'date' (case-insensitive) to YYYY-MM-DD.
+
+    Handles both unix seconds and already formatted date strings.
+    This covers, in particular:
+      - activities: date_logged
+      - expenses:  date_incurred
+      - invoices:  date_raised
+    """
     for col in df.columns:
-        if "date" in col.lower():
+        if "date" not in col.lower():
+            continue
+
+        s = df[col]
+        if s is None or s.isna().all():
+            continue
+
+        try:
+            numeric = pd.to_numeric(s, errors="coerce")
+            if numeric.notna().sum() > 0:
+                dt = pd.to_datetime(numeric, unit="s", errors="coerce", utc=True)
+                mask = numeric.isna() & s.notna()
+                if mask.any():
+                    dt_alt = pd.to_datetime(s[mask], errors="coerce", utc=True)
+                    dt.loc[mask] = dt_alt
+            else:
+                dt = pd.to_datetime(s, errors="coerce", utc=True)
+
+            df[col] = dt.dt.strftime("%Y-%m-%d")
+            df.loc[dt.isna(), col] = None
+        except Exception as e:
+            logger.warning("Date convert failed for %s: %s", col, e)
+
+    return df
+
+
+def sanitize_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert columns that should be numeric (but may contain empty strings)
+    to proper numeric types. Empty strings become NaN/None.
+
+    This helps avoid Power BI errors like VT_BSTR → VT_R8 (e.g. 'ordering').
+    """
+    for col in df.columns:
+        name = col.lower()
+
+        # Skip date-like columns
+        if "date" in name:
+            continue
+
+        series = df[col]
+
+        # Skip if already numeric
+        if pd.api.types.is_numeric_dtype(series):
+            continue
+
+        # Detect numeric-like columns based on a sample
+        sample = series.dropna().astype(str).str.strip().head(50)
+        if sample.empty:
+            continue
+
+        numeric_like = sample.str.match(r"^-?\d+(\.\d+)?$")
+        if numeric_like.mean() >= 0.6:
             try:
-                df[col] = pd.to_datetime(df[col], unit="s", errors="coerce")
-                df[col] = df[col].dt.strftime("%Y-%m-%d")
+                df[col] = pd.to_numeric(series.astype(str).str.strip(), errors="coerce")
             except Exception as e:
-                logger.warning("Date convert failed for %s: %s", col, e)
+                logger.warning("Numeric sanitize failed for %s: %s", col, e)
+
     return df
 
 
 def convert_activities_hours(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Convert billable-related columns from seconds to hours.
+    Convert duration-related columns from seconds to hours for activities.
 
-    This follows the original logic: columns containing 'billable'
-    in their name are divided by 3600.0.
+    Any column whose name contains one of:
+      - 'billable'
+      - 'nonbillable'
+      - 'seconds'
+    is divided by 3600.0.
     """
     for col in df.columns:
-        if "billable" in col.lower():
+        name = col.lower()
+        if any(key in name for key in ["billable", "nonbillable", "seconds"]):
             try:
                 df[col] = pd.to_numeric(df[col], errors="coerce") / 3600.0
             except Exception as e:
@@ -266,7 +330,7 @@ def fetch_activities(
     token: str,
     limit: int = 100,
 ) -> pd.DataFrame:
-    """Fetch activities with explicit field list."""
+    """Fetch activities with explicit field list and apply conversions."""
     fields = (
         "subject,thread_id,contract_period_id,parent,nonbillable,against_id,"
         "rate_charged,date_started,date_logged,rate,visibility,invoice_id,"
@@ -284,6 +348,7 @@ def fetch_activities(
     )
     df = convert_date_columns(df)
     df = convert_activities_hours(df)
+    df = sanitize_numeric_columns(df)
     return df
 
 
@@ -370,7 +435,26 @@ def main():
         (f"{base}contracts/types", "contract_types_data", None, False),
     ]
 
+    # --- internal selection: run only specific tables ---
+    # Leave RUN_ONLY empty to refresh ALL tables.
+    RUN_ONLY = [
+        # "invoices_data",
+        # "tasks_data",
+        # "invoices_data",
+        # "jobs_data",
+        # "companies_data",
+    ]
+
+    if RUN_ONLY:
+        logger.info("RUN_ONLY enabled → refreshing only: %s", ", ".join(RUN_ONLY))
+    else:
+        logger.info("RUN_ONLY empty → refreshing ALL endpoints")
+
     for url, table, extra_key, is_activities in endpoints:
+
+        if RUN_ONLY and table not in RUN_ONLY:
+            continue
+
         try:
             logger.info("Processing endpoint %s → table %s", url, table)
 
@@ -386,6 +470,7 @@ def main():
                     fields="_ALL",
                 )
                 df = convert_date_columns(df)
+                df = sanitize_numeric_columns(df)
 
             export_df_to_postgres(df, db_master, table)
 
