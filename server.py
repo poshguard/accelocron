@@ -436,16 +436,17 @@ def main():
     ]
 
     # Leave empty to refresh ALL
-    RUN_ONLY: list[str] = [
-        "staff_data",
-        "memberships_data",
-        "groups_data",
-    ]
+    # RUN_ONLY: list[str] = [
+    #     "staff_data",
+    #     "memberships_data",
+    #     "groups_data",
+    # ]
 
-    if RUN_ONLY:
-        logger.info("RUN_ONLY enabled → refreshing only: %s", ", ".join(RUN_ONLY))
-    else:
-        logger.info("RUN_ONLY empty → refreshing ALL endpoints")
+    # if RUN_ONLY:
+    #     logger.info("RUN_ONLY enabled → refreshing only: %s", ", ".join(RUN_ONLY))
+    # else:
+    
+    logger.info("RUN_ONLY empty → refreshing ALL endpoints")
 
     results: list[str] = []
 
