@@ -4,6 +4,7 @@ import time
 import json
 import logging
 import traceback
+import re
 
 import requests
 import pandas as pd
@@ -86,6 +87,14 @@ def get_access_token(
     if not token:
         raise RuntimeError("No access_token in token response")
     return token
+
+
+def safe_column_name(name: str) -> str:
+    """Normalize profile field names into stable SQL/Power BI column names."""
+    name = str(name).strip().lower()
+    name = re.sub(r"[^a-z0-9]+", "_", name)
+    name = re.sub(r"_+", "_", name).strip("_")
+    return name
 
 
 # ---------------------------------------------------------------------------
@@ -298,9 +307,136 @@ def json_safe_object_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def first_non_null(series: pd.Series):
+    """Return first non-empty value from a Series."""
+    for v in series:
+        if pd.notna(v):
+            s = str(v).strip()
+            if s and s.lower() != "nan":
+                return s
+    return None
+
+
+def normalize_profile_value(row: pd.Series):
+    """Choose the best display value for a profile row from value/values."""
+    value = row.get("value")
+    if pd.notna(value):
+        s = str(value).strip()
+        if s and s.lower() != "nan":
+            return s
+
+    values = row.get("values")
+    if values is None or (isinstance(values, float) and pd.isna(values)):
+        return None
+
+    if isinstance(values, list):
+        cleaned = [str(x).strip() for x in values if pd.notna(x) and str(x).strip()]
+        return ", ".join(cleaned) if cleaned else None
+
+    s = str(values).strip()
+    if not s or s.lower() == "nan":
+        return None
+
+    try:
+        parsed = json.loads(s.replace("'", '"'))
+        if isinstance(parsed, list):
+            cleaned = [str(x).strip() for x in parsed if pd.notna(x) and str(x).strip()]
+            return ", ".join(cleaned) if cleaned else None
+    except Exception:
+        pass
+
+    return s
+
+
+def transform_company_profiles_wide(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert raw companies/profiles/values rows into one row per company link_id."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    required = {"link_id", "field_name"}
+    missing = required - set(df.columns)
+    if missing:
+        raise RuntimeError(f"company_profiles_data missing required columns: {missing}")
+
+    work = df.copy()
+    work["link_id"] = pd.to_numeric(work["link_id"], errors="coerce")
+    work = work[work["link_id"].notna()].copy()
+    work["link_id"] = work["link_id"].astype("int64")
+    work["field_name"] = work["field_name"].map(safe_column_name)
+    work["profile_value"] = work.apply(normalize_profile_value, axis=1)
+
+    work = work[work["field_name"].ne("") & work["field_name"].notna()]
+    work = work[work["profile_value"].notna()]
+
+    grouped = (
+        work.groupby(["link_id", "field_name"], dropna=False)["profile_value"]
+        .agg(first_non_null)
+        .reset_index()
+    )
+
+    wide = (
+        grouped.pivot(index="link_id", columns="field_name", values="profile_value")
+        .reset_index()
+    )
+    wide.columns.name = None
+    wide = wide.sort_values("link_id").reset_index(drop=True)
+    return wide
+
+
 # ---------------------------------------------------------------------------
 # Fetchers
 # ---------------------------------------------------------------------------
+def fetch_profile_endpoint_until_empty(
+    session: requests.Session,
+    endpoint_url: str,
+    token: str,
+    limit: int = 100,
+    fields: str = "_ALL",
+) -> pd.DataFrame:
+    """Fetch profile endpoints page-by-page until Accelo returns an empty page."""
+    headers = {"Authorization": f"Bearer {token}"}
+    all_rows: list[dict] = []
+    page = 0
+    desc = endpoint_url.split("/")[-1] or endpoint_url
+
+    with tqdm(desc=f"Downloading {desc}") as bar:
+        while True:
+            url = f"{endpoint_url}?_page={page}&_limit={limit}&_fields={fields}"
+            r = session.get(url, headers=headers, timeout=120)
+            if r.status_code == 429:
+                honor_retry_after(r)
+                r = session.get(url, headers=headers, timeout=120)
+
+            if r.status_code != 200:
+                raise RuntimeError(
+                    f"Profile endpoint {endpoint_url} page {page} failed: {r.status_code} {r.text[:500]}"
+                )
+
+            j = r.json()
+            resp = j.get("response", [])
+            if not isinstance(resp, list):
+                raise RuntimeError(f"Unexpected profile response format on page {page}: {json.dumps(j)[:500]}")
+
+            if not resp:
+                break
+
+            all_rows.extend(resp)
+            bar.update(1)
+
+            if len(resp) < limit:
+                break
+
+            page += 1
+
+    if not all_rows:
+        logger.warning("No rows downloaded for profile endpoint %s", endpoint_url)
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows)
+    logger.info("Profile endpoint %s: downloaded %s rows", endpoint_url, len(df))
+    return df
+
+
 def fetch_generic(
     session: requests.Session,
     endpoint_url: str,
@@ -436,7 +572,11 @@ def main():
     ]
 
     # Leave empty to refresh ALL
-    RUN_ONLY: list[str] = []
+    RUN_ONLY: list[str] = [
+        # "jobs_profiles_data",
+        # "company_profiles_data",
+    #     "groups_data",
+    ]
 
     if RUN_ONLY:
         logger.info("RUN_ONLY enabled → refreshing only: %s", ", ".join(RUN_ONLY))
@@ -454,6 +594,11 @@ def main():
 
             if is_activities:
                 df = fetch_activities(session, url, token, limit=100)
+            elif table == "company_profiles_data":
+                df = fetch_profile_endpoint_until_empty(session, url, token, limit=100, fields="_ALL")
+                df = transform_company_profiles_wide(df)
+                df = json_safe_object_columns(df)
+                df = force_numeric_for_table(df, table)
             else:
                 df = fetch_generic(session, url, token, limit=100, extra_response_key=extra_key, fields="_ALL")
                 df = convert_date_columns(df)
